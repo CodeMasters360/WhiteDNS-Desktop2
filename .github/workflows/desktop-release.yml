@@ -1,0 +1,294 @@
+name: Desktop Release Builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Desktop release version. Defaults to the desktop-v* tag suffix or the Makefile default."
+        required: false
+        type: string
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: whitedns-desktop-macos-amd64
+            os: macos-latest
+            kind: macos
+            platform: darwin/amd64
+            arch: amd64
+          - artifact: whitedns-desktop-macos-arm64
+            os: macos-latest
+            kind: macos
+            platform: darwin/arm64
+            arch: arm64
+          - artifact: whitedns-desktop-windows-x64
+            os: macos-latest
+            kind: windows
+            platform: windows/amd64
+            arch: amd64
+          - artifact: whitedns-desktop-windows-arm64-windows-on-arm
+            os: macos-latest
+            kind: windows
+            platform: windows/arm64
+            arch: arm64
+          - artifact: whitedns-desktop-linux-amd64
+            os: ubuntu-24.04
+            kind: linux
+            platform: linux/amd64
+            arch: amd64
+            webkit: "4.1"
+            linux_tags: webkit2_41
+            package_formats: deb,rpm,arch,appimage
+          - artifact: whitedns-desktop-linux-arm64
+            os: ubuntu-24.04-arm
+            kind: linux
+            platform: linux/arm64
+            arch: arm64
+            webkit: "4.1"
+            linux_tags: webkit2_41
+            package_formats: deb,rpm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Resolve desktop version
+        id: desktop-version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          version="$(python3 desktop/scripts/app-version.py --version "$INPUT_VERSION" --ref "$GITHUB_REF_NAME")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "VITE_APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.9"
+          cache: true
+          cache-dependency-path: |
+            desktop/go.sum
+            MasterDnsVPN/go.sum
+            CottenDNS/go.sum
+            Soar/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: bash desktop/scripts/install-ci-linux-deps.sh "${{ matrix.arch }}"
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix desktop/frontend
+
+      - name: Install Wails CLI
+        working-directory: desktop
+        run: |
+          WAILS_VERSION="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
+
+      - name: Build frontend and test desktop integration
+        run: |
+          npm run build --prefix desktop/frontend
+          if [ "${{ matrix.kind }}" = "linux" ]; then
+            go -C desktop test -tags webkit2_41 ./... -count=1 -timeout=180s
+          else
+            go -C desktop test ./... -count=1 -timeout=180s
+          fi
+      - name: Test Soar wrapper and transport compatibility
+        if: matrix.artifact == 'whitedns-desktop-windows-x64'
+        run: |
+          go -C Soar test ./... -count=1 -timeout=120s
+          go -C Soar/third_party/soar test ./... -count=1 -timeout=180s
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.kind }}" in
+            macos)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-mac MACOS_PLATFORMS="${{ matrix.platform }}" MACOS_CLIENT_ARCH="${{ matrix.arch }}"
+              ;;
+            windows)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-windows WINDOWS_PLATFORMS="${{ matrix.platform }}" WINDOWS_CLIENT_ARCH="${{ matrix.arch }}"
+              ;;
+            linux)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-linux LINUX_PLATFORMS="${{ matrix.platform }}" LINUX_CLIENT_ARCH="${{ matrix.arch }}" LINUX_GO_TAGS="${{ matrix.linux_tags }}"
+              ;;
+          esac
+          make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" stage-artifacts PLATFORM="${{ matrix.artifact }}"
+
+      - name: Verify embedded Soar engine
+        run: python3 desktop/scripts/verify-soar-package.py "${{ matrix.kind == 'macos' && 'darwin' || matrix.kind }}" "${{ matrix.arch }}"
+
+      - name: Verify embedded CottenDNS engine
+        run: python3 desktop/scripts/verify-cottendns-package.py "${{ matrix.kind == 'macos' && 'darwin' || matrix.kind }}" "${{ matrix.arch }}"
+
+      - name: Archive package
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          source_dir="desktop/build/releases/${{ matrix.artifact }}"
+          desktop_version="${{ steps.desktop-version.outputs.version }}"
+          asset_platform="${{ matrix.artifact }}"
+          asset_platform="${asset_platform#whitedns-desktop-}"
+          paths=""
+          release_paths=""
+          case "${{ matrix.kind }}" in
+            macos)
+              archive="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.zip"
+              (cd "$source_dir" && ditto -c -k --sequesterRsrc --keepParent "WhiteDNS Desktop.app" "../$(basename "$archive")")
+              paths="$archive"
+              release_paths="$archive"
+              ;;
+            windows)
+              archive="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.zip"
+              (cd "$source_dir" && zip -qry "../$(basename "$archive")" .)
+              paths="$source_dir"
+              release_paths="$archive"
+              ;;
+            linux)
+              archive="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.tar.gz"
+              tar -czf "$archive" -C "$source_dir" .
+              package_formats="${{ matrix.package_formats }}"
+              if [ -z "$package_formats" ]; then
+                package_formats="deb,rpm"
+              fi
+              APP_NAME="WhiteDNS Desktop" \
+                VERSION="$desktop_version" \
+                PACKAGE_SOURCE_DIR="build/releases/${{ matrix.artifact }}" \
+                PACKAGE_OUTPUT_DIR="build/releases" \
+                LINUX_ARCH="${{ matrix.arch }}" \
+                LINUX_WEBKIT="${{ matrix.webkit }}" \
+                LINUX_ASSET_SUFFIX="$asset_platform" \
+                LINUX_PACKAGE_FORMATS="$package_formats" \
+                desktop/scripts/package-linux-dist.sh
+              release_paths="$archive"
+              for package in desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.deb desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.rpm; do
+                release_paths="${release_paths}"$'\n'"$package"
+              done
+              rpm_package="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.rpm"
+              if ! rpm -qpR "$rpm_package" | grep -Fxq 'webkit2gtk4.1'; then
+                echo "RPM is missing the WebKitGTK 4.1 runtime dependency" >&2
+                exit 1
+              fi
+              if [[ ",$package_formats," == *",arch,"* ]]; then
+                arch_package="$(find desktop/build/releases -maxdepth 1 -type f -name 'whitedns-desktop-*.pkg.tar.zst' -print -quit)"
+                test -n "$arch_package"
+                archive_entries="$(bsdtar -tf "$arch_package")"
+                grep -Fxq '.BUILDINFO' <<<"$archive_entries"
+                grep -Fxq '.MTREE' <<<"$archive_entries"
+                grep -Fxq '.PKGINFO' <<<"$archive_entries"
+                pkginfo="$(bsdtar -xOf "$arch_package" .PKGINFO)"
+                grep -Fxq 'xdata = pkgtype=pkg' <<<"$pkginfo"
+                grep -Fxq 'depend = gtk3' <<<"$pkginfo"
+                grep -Fxq 'depend = webkit2gtk-4.1' <<<"$pkginfo"
+              fi
+              if [[ ",$package_formats," == *",appimage,"* ]]; then
+                appimage="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.AppImage"
+                test -x "$appimage"
+                release_paths="${release_paths}"$'\n'"$appimage"
+              fi
+              paths="$source_dir"
+              ;;
+          esac
+          {
+            echo "paths<<EOF"
+            printf '%s\n' "$paths"
+            echo "EOF"
+            echo "release_paths<<EOF"
+            printf '%s\n' "$release_paths"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$paths" | xargs ls -lh
+
+      - name: Upload Arch Linux package
+        if: matrix.kind == 'linux' && matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v6
+        with:
+          name: whitedns-desktop-archlinux-x64
+          path: desktop/build/releases/whitedns-desktop-*.pkg.tar.zst
+          if-no-files-found: error
+
+      - name: Upload package
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.archive.outputs.paths }}
+          if-no-files-found: error
+
+      - name: Upload Linux installers
+        if: matrix.kind == 'linux'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}-installers
+          path: ${{ steps.archive.outputs.release_paths }}
+          if-no-files-found: error
+
+      - name: Upload GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.artifact }}
+          path: ${{ steps.archive.outputs.release_paths }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: build
+    # Matches the Linux build jobs. ubuntu-22.04 stopped being allocatable and
+    # the job failed in seconds without ever picking up a runner.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v6
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download Arch Linux package
+        uses: actions/download-artifact@v6
+        with:
+          name: whitedns-desktop-archlinux-x64
+          path: release-assets
+
+      - name: List release assets
+        run: find release-assets -maxdepth 1 -type f -print | sort
+
+      - name: Generate package checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          # Ship as a draft so release notes can be reviewed before it goes public.
+          draft: true
