@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Desktop release version. Defaults to the desktop-v* tag suffix or the Makefile default."
+        description: "Release version (e.g. 1.5.0). Leave blank for auto-versioning or latest."
         required: false
         type: string
   push:
@@ -25,16 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact: whitedns-desktop-macos-amd64
-            os: macos-latest
-            kind: macos
-            platform: darwin/amd64
-            arch: amd64
-          - artifact: whitedns-desktop-macos-arm64
-            os: macos-latest
-            kind: macos
-            platform: darwin/arm64
-            arch: arm64
+          # Windows Targets (Cross-compiled using macOS runner as configured in original toolchain)
           - artifact: whitedns-desktop-windows-x64
             os: macos-latest
             kind: windows
@@ -45,6 +36,7 @@ jobs:
             kind: windows
             platform: windows/arm64
             arch: arm64
+          # Linux Targets
           - artifact: whitedns-desktop-linux-amd64
             os: ubuntu-24.04
             kind: linux
@@ -63,25 +55,31 @@ jobs:
             package_formats: deb,rpm
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      # Pull latest code and submodules directly from upstream repository
+      - name: Checkout upstream repository
+        uses: actions/checkout@v4
         with:
+          repository: WhiteDNS/WhiteDNS-Desktop
+          ref: main
           submodules: recursive
+          fetch-depth: 0
 
+      # Resolve application version dynamically
       - name: Resolve desktop version
         id: desktop-version
         shell: bash
         env:
-          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
         run: |
           set -euo pipefail
-          version="$(python3 desktop/scripts/app-version.py --version "$INPUT_VERSION" --ref "$GITHUB_REF_NAME")"
+          version="$(python3 desktop/scripts/app-version.py --version "$INPUT_VERSION" --ref "${GITHUB_REF_NAME:-main}")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "VITE_APP_VERSION=$version" >> "$GITHUB_ENV"
 
+      # Setup Go runtime environment
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v5
         with:
           go-version: "1.26.9"
           cache: true
@@ -91,26 +89,31 @@ jobs:
             CottenDNS/go.sum
             Soar/go.sum
 
+      # Setup Node.js runtime environment
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: desktop/frontend/package-lock.json
 
+      # Install Linux build and GTK/WebKit dependencies
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: bash desktop/scripts/install-ci-linux-deps.sh "${{ matrix.arch }}"
 
+      # Install frontend dependencies via npm
       - name: Install frontend dependencies
         run: npm ci --prefix desktop/frontend
 
+      # Install Wails CLI tool
       - name: Install Wails CLI
         working-directory: desktop
         run: |
           WAILS_VERSION="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
           go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
 
+      # Build frontend UI and run tests
       - name: Build frontend and test desktop integration
         run: |
           npm run build --prefix desktop/frontend
@@ -119,19 +122,20 @@ jobs:
           else
             go -C desktop test ./... -count=1 -timeout=180s
           fi
+
+      # Test Soar wrapper and transport on Windows build
       - name: Test Soar wrapper and transport compatibility
         if: matrix.artifact == 'whitedns-desktop-windows-x64'
         run: |
           go -C Soar test ./... -count=1 -timeout=120s
           go -C Soar/third_party/soar test ./... -count=1 -timeout=180s
+
+      # Compile and package binary artifacts
       - name: Build package
         shell: bash
         run: |
           set -euo pipefail
           case "${{ matrix.kind }}" in
-            macos)
-              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-mac MACOS_PLATFORMS="${{ matrix.platform }}" MACOS_CLIENT_ARCH="${{ matrix.arch }}"
-              ;;
             windows)
               make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-windows WINDOWS_PLATFORMS="${{ matrix.platform }}" WINDOWS_CLIENT_ARCH="${{ matrix.arch }}"
               ;;
@@ -141,12 +145,14 @@ jobs:
           esac
           make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" stage-artifacts PLATFORM="${{ matrix.artifact }}"
 
+      # Verify compiled embedded engines
       - name: Verify embedded Soar engine
-        run: python3 desktop/scripts/verify-soar-package.py "${{ matrix.kind == 'macos' && 'darwin' || matrix.kind }}" "${{ matrix.arch }}"
+        run: python3 desktop/scripts/verify-soar-package.py "${{ matrix.kind }}" "${{ matrix.arch }}"
 
       - name: Verify embedded CottenDNS engine
-        run: python3 desktop/scripts/verify-cottendns-package.py "${{ matrix.kind == 'macos' && 'darwin' || matrix.kind }}" "${{ matrix.arch }}"
+        run: python3 desktop/scripts/verify-cottendns-package.py "${{ matrix.kind }}" "${{ matrix.arch }}"
 
+      # Archive and package distribution bundles
       - name: Archive package
         id: archive
         shell: bash
@@ -160,12 +166,6 @@ jobs:
           paths=""
           release_paths=""
           case "${{ matrix.kind }}" in
-            macos)
-              archive="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.zip"
-              (cd "$source_dir" && ditto -c -k --sequesterRsrc --keepParent "WhiteDNS Desktop.app" "../$(basename "$archive")")
-              paths="$archive"
-              release_paths="$archive"
-              ;;
             windows)
               archive="desktop/build/releases/WhiteDNS-Desktop-${desktop_version}-${asset_platform}.zip"
               (cd "$source_dir" && zip -qry "../$(basename "$archive")" .)
@@ -229,14 +229,14 @@ jobs:
 
       - name: Upload Arch Linux package
         if: matrix.kind == 'linux' && matrix.arch == 'amd64'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: whitedns-desktop-archlinux-x64
           path: desktop/build/releases/whitedns-desktop-*.pkg.tar.zst
           if-no-files-found: error
 
       - name: Upload package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ steps.archive.outputs.paths }}
@@ -244,15 +244,15 @@ jobs:
 
       - name: Upload Linux installers
         if: matrix.kind == 'linux'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}-installers
           path: ${{ steps.archive.outputs.release_paths }}
           if-no-files-found: error
 
+      # Stash release assets for the publish step (runs unconditionally)
       - name: Upload GitHub Release assets
-        if: startsWith(github.ref, 'refs/tags/desktop-v')
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.artifact }}
           path: ${{ steps.archive.outputs.release_paths }}
@@ -260,21 +260,18 @@ jobs:
 
   publish:
     name: Publish release assets
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
     needs: build
-    # Matches the Linux build jobs. ubuntu-22.04 stopped being allocatable and
-    # the job failed in seconds without ever picking up a runner.
     runs-on: ubuntu-24.04
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
 
       - name: Download Arch Linux package
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v4
         with:
           name: whitedns-desktop-archlinux-x64
           path: release-assets
@@ -286,9 +283,28 @@ jobs:
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS.txt
 
+      # Determine release tag: use tag name if pushed, otherwise default to continuous release tag
+      - name: Compute Release Tag
+        id: tag-info
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "title=Release ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.version }}" ]; then
+            echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "title=Release v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "title=Continuous Latest Release" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish or update the GitHub Release
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag-info.outputs.tag }}
+          name: ${{ steps.tag-info.outputs.title }}
           files: release-assets/*
-          # Ship as a draft so release notes can be reviewed before it goes public.
-          draft: true
+          draft: false
+          prerelease: ${{ steps.tag-info.outputs.tag == 'latest' }}
